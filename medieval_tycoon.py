@@ -5,6 +5,7 @@ Balance:  python medieval_idle.py sim            (idle economy simulation)
           python medieval_idle.py sim active     (bot that clicks + uses the decree)
 """
 import json
+import math
 import os
 import time
 
@@ -14,6 +15,8 @@ COST_GROWTH = 1.15
 OFFLINE_CAP = 8 * 3600        # max offline progress (seconds)
 OFFLINE_STEP = 10             # offline simulation step (seconds)
 WAVE_INTERVAL = 300           # seconds between enemy waves (live play only)
+WAVE_GRACE = 120              # on entering, the next wave arrives within this many seconds (0 = instantly)
+LOSS_FRACTION = 0.3           # share of each unit type lost when a wave breaks through
 BASE_GOLD_INCOME = 0.2        # passive tax, prevents a dead-end start
 SMITH_MAX = 10
 GATHER_CD = 1.0               # seconds between manual gathers
@@ -51,6 +54,8 @@ def new_state():
         "clock": 0.0,
         "next_wave": float(WAVE_INTERVAL),
         "wave": 0,
+        "best_wave": 0,
+        "wave_start": 0.0,
         "last": time.time(),
         "last_gather": 0.0,
         "decree_left": 0.0,
@@ -143,17 +148,28 @@ def use_decree(s):
 
 def check_wave(s):
     while s["clock"] >= s["next_wave"]:
-        w = s["wave"]
+        w = s["wave"]                      # waves already repelled in this streak
         enemy, mine = enemy_power(w), army_power(s)
         if mine >= enemy:
             reward = 50 * (w + 1)
             s["res"]["gold"] += reward
-            s["log"].append(f"Wave {w + 1} repelled! ({mine:.0f} vs {enemy:.0f}) +{reward} gold")
+            msg = f"Wave {w + 1} repelled! ({mine:.0f} vs {enemy:.0f}) +{reward} gold"
+            if w + 1 > s["best_wave"]:
+                s["best_wave"] = w + 1
+                msg += "  NEW RECORD!"
+            s["log"].append(msg)
+            s["wave"] += 1
         else:
-            for u in s["units"]:
-                s["units"][u] = int(s["units"][u] * 0.7)
-            s["log"].append(f"Wave {w + 1} broke through! ({mine:.0f} vs {enemy:.0f}) You lost 30% of your army.")
-        s["wave"] += 1
+            lost = 0
+            for u, n in s["units"].items():
+                loss = math.ceil(n * LOSS_FRACTION)     # ceil: tiny armies are not immune
+                s["units"][u] = n - loss
+                lost += loss
+            s["log"].append(
+                f"Wave {w + 1} broke through! ({mine:.0f} vs {enemy:.0f}) {lost} units fell. "
+                f"Streak ended at {w} waves (record {s['best_wave']}). The siege starts over at wave 1.")
+            s["wave"] = 0
+        s["wave_start"] = s["next_wave"]
         s["next_wave"] += WAVE_INTERVAL
 
 
@@ -242,6 +258,17 @@ def save(s):
     os.replace(tmp, SAVE)    # atomic: a crash mid-write can't corrupt the save
 
 
+def start_session(s):
+    """Called on every entry. The next wave comes within WAVE_GRACE seconds,
+    and never later than it was already due (so quit/re-enter cannot dodge waves)."""
+    remaining = max(0.0, s["next_wave"] - s["clock"])
+    s["clock"] = 0.0
+    s["next_wave"] = min(remaining, float(WAVE_GRACE))
+    s["wave_start"] = 0.0
+    s["log"].append(f"Scouts spot wave {s['wave'] + 1} approaching - it arrives in "
+                    f"{fmt_time(s['next_wave'])}.")
+
+
 def load():
     base = new_state()
     if not os.path.exists(SAVE):
@@ -253,11 +280,12 @@ def load():
             for key, val in s[k].items():
                 if key in base[k]:
                     base[k][key] = val
-        for k in ("smith_level", "clock", "next_wave", "wave", "last", "log", "decree_left", "decree_cd"):
+        for k in ("smith_level", "clock", "next_wave", "wave", "best_wave", "last", "log", "decree_left", "decree_cd"):
             if k in s:
                 base[k] = s[k]
         base["last"] = min(float(base["last"]), time.time())
         update(base)
+        start_session(base)
         return base
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         base = new_state()
@@ -493,14 +521,15 @@ def run_gui():
         c.delete("all")
         w, h = max(c.winfo_width(), 200), 30
         eta = max(0.0, state["next_wave"] - state["clock"])
-        frac = min(1.0, max(0.0, 1 - eta / WAVE_INTERVAL))
+        span = max(1.0, state["next_wave"] - state["wave_start"])
+        frac = min(1.0, max(0.0, (state["clock"] - state["wave_start"]) / span))
         enemy, mine = enemy_power(state["wave"]), army_power(state)
         c.create_rectangle(1, 1, w - 1, h - 1, fill=BG, outline=GOLD)
         c.create_rectangle(3, 3, 3 + (w - 6) * frac, h - 3, outline="",
                            fill="#5a7d2a" if mine >= enemy else "#a8321e")
         c.create_text(w / 2, h / 2, fill=PARCH, font=F(10, "bold"),
                       text=f"⚔ Wave {state['wave'] + 1} arrives in {fmt_time(eta)}   |   "
-                           f"Enemy {enemy:.0f}  vs  Your army {mine:.0f}")
+                           f"Enemy {enemy:.0f}  vs  Your army {mine:.0f}   |   🏆 Record {state['best_wave']}")
 
     def refresh():
         rates = net_rates(state)
@@ -556,7 +585,8 @@ def run_gui():
                     afford = can_afford(state["res"], c) and state["buildings"]["blacksmith"] > 0
             btn.set_enabled(afford)
 
-        army_info.config(text=f"🛡 Total army power: {army_power(state):.1f}")
+        army_info.config(text=f"🛡 Total army power: {army_power(state):.1f}     "
+                              f"🏆 Best streak: {state['best_wave']} waves")
 
         text = "\n".join(state["log"][-6:])
         if text != log_cache[0]:
@@ -578,8 +608,11 @@ def run_gui():
 
     def reset():
         nonlocal state
-        if messagebox.askyesno("Reset kingdom", "Burn it all down and start over?"):
+        if messagebox.askyesno("Reset kingdom",
+                               "Burn it all down and start over?\nYour wave record is kept."):
+            best = state["best_wave"]
             state = new_state()
+            state["best_wave"] = best
             save(state)
 
     def on_close():
